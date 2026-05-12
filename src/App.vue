@@ -19,6 +19,7 @@ const now = ref(Date.now());
 const popoverMode = ref("status");
 const copiedAgentId = ref("");
 const isDraggingAgent = ref(false);
+const hiddenApprovalId = ref("");
 let clock;
 
 const GRID_COLS = 6;
@@ -32,6 +33,9 @@ const selectedAgent = computed(() => {
   if (!state.selectedAgentId) return null;
   return activeAgents.value.find((agent) => agent.id === state.selectedAgentId) || null;
 });
+const approvalAgent = computed(() =>
+  state.agents.find((agent) => agent.pendingApproval && agent.pendingApproval.id !== hiddenApprovalId.value) || null
+);
 
 const hairColors = ["#25323a", "#7a4b35", "#d6a34a", "#5b6472", "#8f4da8"];
 const bodyColors = ["#2d8f7b", "#3b82f6", "#d65f5f", "#7c5bd6", "#e0a33c"];
@@ -63,6 +67,7 @@ const popoverModes = [
   { value: "status", label: "状态" },
   { value: "chat", label: "对话" },
   { value: "cli", label: "CLI" },
+  { value: "cli-detail", label: "详细CLI" },
   { value: "task", label: "任务" },
   { value: "style", label: "造型" },
   { value: "remove", label: "移除" }
@@ -102,6 +107,7 @@ function hydrateAgent(agent) {
     position: agent.position || null,
     events: agent.events || [],
     messages,
+    pendingApproval: agent.pendingApproval || null,
     messagesHydratedUntil: messages[messages.length - 1]?.at || ""
   };
 }
@@ -160,6 +166,18 @@ function subscribe(agentId) {
     agent.lastActivityAt = stampedEvent.at;
     if (stampedEvent.type === "stdout" || stampedEvent.type === "stderr") {
       agent.outputCount = (agent.outputCount || 0) + 1;
+    }
+    if (stampedEvent.type === "approval") {
+      agent.pendingApproval = stampedEvent.approval || {
+        id: `${agent.id}-${stampedEvent.at}`,
+        text: stampedEvent.text,
+        createdAt: stampedEvent.at
+      };
+      hiddenApprovalId.value = "";
+      state.selectedAgentId = agent.id;
+    }
+    if (stampedEvent.type === "approval-resolved") {
+      agent.pendingApproval = null;
     }
     if (stampedEvent.type !== "heartbeat") agent.events.push(stampedEvent);
 
@@ -224,6 +242,24 @@ async function sendTextToAgent(agent, input) {
     method: "POST",
     body: JSON.stringify({ input })
   });
+}
+
+async function answerAgentApproval(agent, decision) {
+  if (!agent) return;
+  if (decision === "later") {
+    hiddenApprovalId.value = agent.pendingApproval?.id || agent.id;
+    return;
+  }
+  try {
+    const { agent: updated } = await api(`/api/agents/${agent.id}/approval`, {
+      method: "POST",
+      body: JSON.stringify({ decision })
+    });
+    agent.pendingApproval = updated.pendingApproval || null;
+    if (!agent.pendingApproval) hiddenApprovalId.value = "";
+  } catch (error) {
+    state.error = `发送确认失败：${error.message}`;
+  }
 }
 
 async function saveAgentPrompt(agent) {
@@ -391,9 +427,34 @@ function eventClass(type) {
     stdout: "cli-stdout",
     stderr: "cli-stderr",
     error: "cli-stderr",
+    approval: "cli-stderr",
+    "approval-resolved": "cli-system",
     human: "cli-human",
+    detail: "cli-system",
     system: "cli-system"
   }[type] || "cli-system";
+}
+
+function eventTypeLabel(type) {
+  return {
+    stdout: "输出",
+    stderr: "错误输出",
+    error: "错误",
+    approval: "确认",
+    "approval-resolved": "确认结果",
+    human: "输入",
+    detail: "详细",
+    system: "系统",
+    heartbeat: "心跳"
+  }[type] || "事件";
+}
+
+function visibleCliEvents(agent) {
+  return (agent.events || []).filter((event) => event.type === "stdout" && cleanText(event.text));
+}
+
+function detailedCliEvents(agent) {
+  return (agent.events || []).filter((event) => event.type !== "heartbeat" && cleanText(event.text));
 }
 
 function statusLabel(status) {
@@ -683,15 +744,29 @@ onUnmounted(() => {
                   </div>
 
                   <div v-else-if="popoverMode === 'cli'" class="popover-body cli-log-popover">
-                    <p class="cli-note">当前小人使用外部 Codex 控制台，完整输出请看打开的 console 窗口。这里记录启动、退出和管理事件。</p>
-                    <p v-if="!agent.events.length" class="muted">还没有 CLI 事件。</p>
+                    <p class="cli-note">当前小人使用后台 Codex 进程。这里只显示 Codex 回复内容。</p>
+                    <p v-if="!visibleCliEvents(agent).length" class="muted">还没有 Codex 回复。</p>
                     <div
-                      v-for="(event, index) in agent.events"
+                      v-for="(event, index) in visibleCliEvents(agent)"
                       :key="`${event.at}-${index}`"
                       class="cli-log-line"
                       :class="eventClass(event.type)"
                     >
-                      <span>{{ event.type }}</span>
+                      <span>{{ eventTypeLabel(event.type) }}</span>
+                      <pre>{{ event.text }}</pre>
+                    </div>
+                  </div>
+
+                  <div v-else-if="popoverMode === 'cli-detail'" class="popover-body cli-log-popover">
+                    <p class="cli-note">这里显示启动、退出、确认、错误和 Codex 过程事件摘要。</p>
+                    <p v-if="!detailedCliEvents(agent).length" class="muted">还没有详细 CLI 事件。</p>
+                    <div
+                      v-for="(event, index) in detailedCliEvents(agent)"
+                      :key="`${event.at}-${index}`"
+                      class="cli-log-line"
+                      :class="eventClass(event.type)"
+                    >
+                      <span>{{ eventTypeLabel(event.type) }}</span>
                       <pre>{{ event.text }}</pre>
                     </div>
                   </div>
@@ -803,6 +878,22 @@ onUnmounted(() => {
       </div>
 
       <p v-if="state.error" class="error-toast">{{ state.error }}</p>
+
+      <section v-if="approvalAgent" class="approval-overlay" @click="answerAgentApproval(approvalAgent, 'later')">
+        <div class="approval-dialog" role="dialog" aria-modal="true" @click.stop>
+          <div class="approval-header">
+            <span>需要确认</span>
+            <button class="icon-button" title="稍后处理" @click="answerAgentApproval(approvalAgent, 'later')">×</button>
+          </div>
+          <p>{{ approvalAgent.name }} 正在等待你确认是否继续。</p>
+          <pre>{{ approvalAgent.pendingApproval.text }}</pre>
+          <div class="approval-actions">
+            <button class="danger-button" @click="answerAgentApproval(approvalAgent, 'no')">拒绝</button>
+            <button class="secondary-button" @click="answerAgentApproval(approvalAgent, 'later')">稍后处理</button>
+            <button class="primary-button" @click="answerAgentApproval(approvalAgent, 'yes')">允许</button>
+          </div>
+        </div>
+      </section>
     </section>
   </main>
 </template>

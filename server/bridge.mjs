@@ -101,6 +101,7 @@ function cleanTerminalText(text) {
     .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, "")
     .replace(/\x1B\][^\x07]*(\x07|\x1B\\)/g, "")
     .replace(/\r/g, "\n")
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "")
     .replace(/[^\S\n]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
@@ -123,12 +124,126 @@ function appendMessage(agent, role, content) {
   });
 }
 
+function extractTextContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (part?.type === "output_text" || part?.type === "text") return part.text || "";
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function extractAssistantTextFromCodexEvent(event) {
+  const candidates = [event.item, event.message, event.payload, event];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (candidate.role === "assistant") {
+      const text = extractTextContent(candidate.content || candidate.text || candidate.message);
+      if (text) return text;
+    }
+    if (candidate.type === "assistant_message") {
+      const text = extractTextContent(candidate.content || candidate.text || candidate.message);
+      if (text) return text;
+    }
+    if (candidate.type === "agent_message") {
+      const text = extractTextContent(candidate.content || candidate.text || candidate.message);
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+function textFromUnknown(value) {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) return value.map(textFromUnknown).filter(Boolean).join("\n");
+  if (typeof value === "object") {
+    return [value.message, value.text, value.reason, value.command, value.description, value.prompt, value.question, value.content]
+      .map(textFromUnknown)
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
+function extractApprovalPromptFromCodexEvent(event) {
+  const candidates = [event.item, event.message, event.payload, event].filter(Boolean);
+  for (const candidate of candidates) {
+    const type = String(candidate.type || event.type || "").toLowerCase();
+    const name = String(candidate.name || "").toLowerCase();
+    if (candidate.role === "assistant" || type === "assistant_message" || type === "agent_message") continue;
+    const text = cleanTerminalText(textFromUnknown(candidate));
+    const searchable = `${type}\n${name}\n${text}`.toLowerCase();
+    const hasApprovalType = /(approval|confirm|permission)/.test(`${type} ${name}`);
+    const asksYesNo = /(yes\/no|\by\/n\b|do you want|allow|approve|confirm|是否|确认|允许|批准|同意|拒绝)/i.test(searchable);
+    if ((hasApprovalType || asksYesNo) && text) return text;
+  }
+  return "";
+}
+
+function describeCodexEvent(event) {
+  const type = String(event?.type || "event");
+  const item = event?.item || event?.message || event?.payload || {};
+  const itemType = item?.type ? ` / ${item.type}` : "";
+  const status = item?.status ? ` / ${item.status}` : "";
+  const text = cleanTerminalText(textFromUnknown(item) || textFromUnknown(event));
+  const head = `Codex 事件：${type}${itemType}${status}`;
+  if (!text) return head;
+  return `${head}\n${text}`.slice(0, 4000);
+}
+
+function createJsonLineReader(onLine) {
+  let buffer = "";
+  return (chunk) => {
+    buffer += chunk;
+    const lines = buffer.split(/\r?\n/);
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      if (line.trim()) onLine(line);
+    }
+  };
+}
+
+function createCodexInvocation(tool, cwd, prompt) {
+  const codexArgs = String(prompt || "").trim() ? [prompt] : [];
+  if (process.platform === "darwin") {
+    return {
+      command: "script",
+      args: ["-q", "/dev/null", tool, "--no-alt-screen", "-C", cwd, ...codexArgs],
+      silentConsole: true,
+      jsonOutput: false,
+      persistent: true
+    };
+  }
+
+  return {
+    command: tool,
+    args: codexArgs,
+    silentConsole: false,
+    jsonOutput: false,
+    persistent: false
+  };
+}
+
+function sendInputToAgentProcess(agent, input) {
+  const text = String(input || "").trim();
+  if (!text) return;
+  if (!agent.child?.stdin || agent.child.stdin.destroyed) {
+    throw new Error("Codex 进程当前无法接收新任务。");
+  }
+  agent.child.stdin.write(`${text}\n`);
+}
+
 function spawnAgent({ room, prompt = "" }) {
   const id = randomUUID();
   const cwd = path.resolve(room.path);
   const tool = getCodexExecutable();
   if (!tool) {
-    throw new Error("codex CLI was not found in PATH.");
+    throw new Error("未在 PATH 中找到 codex CLI。");
   }
 
   const agent = {
@@ -153,6 +268,7 @@ function spawnAgent({ room, prompt = "" }) {
     outputCount: 0,
     events: [],
     messages: [],
+    pendingApproval: null,
     queue: [],
     runningTask: false
   };
@@ -162,7 +278,7 @@ function spawnAgent({ room, prompt = "" }) {
   sendEvent(id, {
     type: "system",
     status: "running",
-    text: `codex agent created in ${cwd}`
+    text: `已在 ${cwd} 创建 Codex 小人。`
   });
 
   agent.heartbeat = setInterval(() => {
@@ -170,7 +286,7 @@ function spawnAgent({ room, prompt = "" }) {
     sendEvent(id, {
       type: "heartbeat",
       status: "running",
-      text: "Codex is still running."
+      text: "Codex 仍在运行。"
     });
   }, 5000);
 
@@ -186,8 +302,26 @@ function runAgentTask(agent, input) {
     sendEvent(agent.id, {
       type: "error",
       status: "needs-human",
-      text: "codex CLI was not found in PATH."
+      text: "未在 PATH 中找到 codex CLI。"
     });
+    return;
+  }
+
+  if (agent.child && agent.pid && agent.persistent) {
+    try {
+      sendInputToAgentProcess(agent, prompt);
+      sendEvent(agent.id, {
+        type: "system",
+        status: "running",
+        text: "已发送到现有 Codex 进程。"
+      });
+    } catch (error) {
+      sendEvent(agent.id, {
+        type: "error",
+        status: "needs-human",
+        text: `发送任务失败：${error.message}`
+      });
+    }
     return;
   }
 
@@ -197,13 +331,13 @@ function runAgentTask(agent, input) {
       sendEvent(agent.id, {
         type: "system",
         status: "running",
-        text: "Restarting this agent's Codex console."
+        text: "正在重启这个小人的 Codex 进程。"
       });
     } catch (error) {
       sendEvent(agent.id, {
         type: "error",
         status: "needs-human",
-        text: `Failed to stop previous Codex console: ${error.message}`
+        text: `停止上一个 Codex 进程失败：${error.message}`
       });
       return;
     }
@@ -211,21 +345,83 @@ function runAgentTask(agent, input) {
 
   agent.runningTask = true;
   agent.status = "running";
-  const args = prompt ? [prompt] : [];
-  const child = spawn(tool, args, {
+  agent.pendingApproval = null;
+  const invocation = createCodexInvocation(tool, agent.cwd, prompt);
+  agent.persistent = invocation.persistent;
+  const child = spawn(invocation.command, invocation.args, {
     cwd: agent.cwd,
-    detached: true,
-    stdio: "ignore",
+    detached: !invocation.silentConsole,
+    stdio: ["pipe", "pipe", "pipe"],
     windowsHide: false,
     env: { ...process.env, FORCE_COLOR: "1" },
-    shell: process.platform === "win32" && tool.toLowerCase().endsWith(".cmd")
+    shell: process.platform === "win32" && invocation.command === tool && tool.toLowerCase().endsWith(".cmd")
   });
   agent.child = child;
   agent.pid = child.pid;
   sendEvent(agent.id, {
     type: "system",
     status: "running",
-    text: `codex console started with PID ${child.pid}`
+    text: invocation.silentConsole
+      ? `Codex 已在后台静默启动，PID：${child.pid}`
+      : `Codex 控制台已启动，PID：${child.pid}`
+  });
+  if (invocation.jsonOutput) child.stdin?.end();
+
+  const onJsonLine = createJsonLineReader((line) => {
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      return;
+    }
+    const approvalPrompt = extractApprovalPromptFromCodexEvent(event);
+    if (approvalPrompt && !agent.pendingApproval) {
+      agent.pendingApproval = {
+        id: randomUUID(),
+        text: approvalPrompt,
+        createdAt: new Date().toISOString()
+      };
+      sendEvent(agent.id, {
+        type: "approval",
+        status: "needs-human",
+        text: approvalPrompt,
+        approval: agent.pendingApproval
+      });
+      return;
+    }
+    const text = cleanTerminalText(extractAssistantTextFromCodexEvent(event));
+    if (text) {
+      appendMessage(agent, "assistant", text);
+      sendEvent(agent.id, { type: "stdout", status: "running", text });
+      return;
+    }
+    sendEvent(agent.id, {
+      type: "detail",
+      status: "running",
+      text: describeCodexEvent(event)
+    });
+  });
+
+  child.stdout?.on("data", (chunk) => {
+    if (invocation.jsonOutput) {
+      onJsonLine(chunk.toString("utf8"));
+      return;
+    }
+    const text = cleanTerminalText(chunk.toString("utf8"));
+    if (!text) return;
+    if (invocation.persistent) {
+      sendEvent(agent.id, { type: "detail", status: "running", text });
+      return;
+    }
+    appendMessage(agent, "assistant", text);
+    sendEvent(agent.id, { type: "stdout", status: "running", text });
+  });
+
+  child.stderr?.on("data", (chunk) => {
+    if (invocation.jsonOutput) return;
+    const text = cleanTerminalText(chunk.toString("utf8"));
+    if (!text) return;
+    sendEvent(agent.id, { type: "stderr", status: "running", text });
   });
 
   child.on("error", (error) => {
@@ -239,10 +435,11 @@ function runAgentTask(agent, input) {
     agent.runningTask = false;
     agent.child = null;
     agent.pid = null;
+    if (code === 0) agent.pendingApproval = null;
     sendEvent(agent.id, {
       type: "system",
       status: code === 0 ? "idle" : "needs-human",
-      text: `codex console exited with code ${code}`
+      text: `Codex 进程已退出，退出码：${code}`
     });
   });
 }
@@ -264,8 +461,33 @@ function getAgentSnapshot(agent) {
     lastActivityAt: agent.lastActivityAt,
     outputCount: agent.outputCount,
     events: agent.events,
-    messages: agent.messages
+    messages: agent.messages,
+    pendingApproval: agent.pendingApproval
   };
+}
+
+function answerAgentApproval(agent, decision) {
+  const normalized = String(decision || "").toLowerCase();
+  if (normalized === "dismiss") {
+    agent.pendingApproval = null;
+    sendEvent(agent.id, { type: "approval-resolved", status: "needs-human", text: "已暂时关闭确认提醒。" });
+    return;
+  }
+
+  if (normalized !== "yes" && normalized !== "no") {
+    throw new Error("确认选择无效。");
+  }
+  if (!agent.child?.stdin || agent.child.stdin.destroyed) {
+    throw new Error("当前静默模式下无法向 Codex 写入确认，请查看详细 CLI 后手动处理。");
+  }
+
+  agent.child.stdin.write(normalized === "yes" ? "y\n" : "n\n");
+  agent.pendingApproval = null;
+  sendEvent(agent.id, {
+    type: "approval-resolved",
+    status: "running",
+    text: normalized === "yes" ? "已向 Codex 发送允许。" : "已向 Codex 发送拒绝。"
+  });
 }
 
 function killAgentProcess(agent) {
@@ -303,7 +525,7 @@ const server = http.createServer(async (req, res) => {
       const projectPath = path.resolve(String(body.path || ""));
       const info = await stat(projectPath);
       if (!info.isDirectory()) {
-        json(res, 400, { error: "Project path must be a directory" });
+        json(res, 400, { error: "项目路径必须是一个目录。" });
         return;
       }
       const rooms = await readRooms();
@@ -329,7 +551,7 @@ const server = http.createServer(async (req, res) => {
       const rooms = await readRooms();
       const room = rooms.find((item) => item.id === id);
       if (!room) {
-        json(res, 404, { error: "Room not found" });
+        json(res, 404, { error: "未找到房间。" });
         return;
       }
 
@@ -352,7 +574,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.pathname.split("/")[3];
       const agent = agents.get(id);
       if (!agent) {
-        json(res, 404, { error: "Agent not found" });
+        json(res, 404, { error: "未找到小人。" });
         return;
       }
 
@@ -360,7 +582,7 @@ const server = http.createServer(async (req, res) => {
       sendEvent(id, {
         type: "system",
         status: "done",
-        text: "Agent was removed by user."
+        text: "小人已被移除。"
       });
       try {
         killAgentProcess(agent);
@@ -368,7 +590,7 @@ const server = http.createServer(async (req, res) => {
         sendEvent(id, {
           type: "error",
           status: "needs-human",
-          text: `Failed to kill agent process: ${error.message}`
+          text: `终止小人进程失败：${error.message}`
         });
       }
       agents.delete(id);
@@ -383,7 +605,7 @@ const server = http.createServer(async (req, res) => {
       const rooms = await readRooms();
       const room = rooms.find((item) => item.id === body.roomId);
       if (!room) {
-        json(res, 404, { error: "Room not found" });
+        json(res, 404, { error: "未找到房间。" });
         return;
       }
       const agent = spawnAgent({ room, prompt: body.prompt });
@@ -395,7 +617,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.pathname.split("/")[3];
       const agent = agents.get(id);
       if (!agent) {
-        json(res, 404, { error: "Agent not found" });
+        json(res, 404, { error: "未找到小人。" });
         return;
       }
       const body = await parseBody(req);
@@ -407,16 +629,29 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname.startsWith("/api/agents/") && url.pathname.endsWith("/approval")) {
+      const id = url.pathname.split("/")[3];
+      const agent = agents.get(id);
+      if (!agent) {
+        json(res, 404, { error: "未找到小人。" });
+        return;
+      }
+      const body = await parseBody(req);
+      answerAgentApproval(agent, body.decision);
+      json(res, 200, { agent: getAgentSnapshot(agent) });
+      return;
+    }
+
     if (req.method === "POST" && url.pathname.startsWith("/api/agents/") && url.pathname.endsWith("/prompt")) {
       const id = url.pathname.split("/")[3];
       const agent = agents.get(id);
       if (!agent) {
-        json(res, 404, { error: "Agent not found" });
+        json(res, 404, { error: "未找到小人。" });
         return;
       }
       const body = await parseBody(req);
       agent.prompt = String(body.prompt || "");
-      sendEvent(id, { type: "system", text: "Task instruction was updated." });
+      sendEvent(id, { type: "system", text: "任务说明已更新。" });
       json(res, 200, { agent: getAgentSnapshot(agent) });
       return;
     }
@@ -425,7 +660,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.pathname.split("/")[3];
       const agent = agents.get(id);
       if (!agent) {
-        json(res, 404, { error: "Agent not found" });
+        json(res, 404, { error: "未找到小人。" });
         return;
       }
       const body = await parseBody(req);
@@ -444,7 +679,7 @@ const server = http.createServer(async (req, res) => {
           y: Math.max(0, Number(body.position.y))
         };
       }
-      sendEvent(id, { type: "system", text: "Agent profile was updated." });
+      sendEvent(id, { type: "system", text: "小人资料已更新。" });
       json(res, 200, { agent: getAgentSnapshot(agent) });
       return;
     }
@@ -453,7 +688,7 @@ const server = http.createServer(async (req, res) => {
       const id = url.pathname.split("/")[3];
       const agent = agents.get(id);
       if (!agent) {
-        json(res, 404, { error: "Agent not found" });
+        json(res, 404, { error: "未找到小人。" });
         return;
       }
 
@@ -474,7 +709,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    json(res, 404, { error: "Not found" });
+    json(res, 404, { error: "未找到接口。" });
   } catch (error) {
     json(res, 500, { error: error.message });
   }
